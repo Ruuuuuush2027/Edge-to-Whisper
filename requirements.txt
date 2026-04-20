@@ -1,0 +1,11 @@
+pyaudio
+PyWavelets
+requests
+numpy
+flask
+torch
+transformers
+openai-whisper
+torchaudio
+gradio
+matplotlib
