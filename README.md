@@ -1,5 +1,7 @@
 ## Edge-to-Whisper: Real-Time Denoised Audio Transcription
 
+### link: `https://github.com/Ruuuuuush2027/Edge-to-Whisper`
+
 ### Team Member Names
 - `Mo Jiang`
 - `Junsoo Kim`
@@ -35,8 +37,3 @@ This project is a two-node IoT system designed for high-fidelity speech reconstr
     This script runs on the Raspberry Pi to handle high-frequency data collection from the USB microphone. It performs temporal-spectral denoising using a Discrete Wavelet Transform to isolate linguistic signals from environmental noise before transmission, fulfilling the requirement for non-trivial edge processing. Cleaned audio chunks are then dispatched to the server node via HTTP POST requests.
 2. `pc_receiver.py` (Neural Inference & Visualization)
     This script runs on the PC to act as the central hub for heavy computational offloading. It hosts a Flask-based REST API that asynchronously buffers incoming data and feeds it into a CUDA-accelerated Transformer model (`whisper-large-v3-turbo`) for real-time speech-to-text inference. Finally, it renders a reactive Gradio dashboard to provide a polished web interface for data visualization.
-
-### AI Usage Statement
-- We came up with the project idea and wrote most of the core code ourselves (PC-side model loading, transformer input feeding and display, Gradio UI, silence thresholding, and filtering).
-- AI helped optimize implementation details such as thread creation, multithreading, graceful shutdown handling, and server-side debug printing.
-- AI also suggested integration ideas for Gradio and web interfacing.
