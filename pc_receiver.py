@@ -36,7 +36,15 @@ GRADIO_PORT = 7860
 GRADIO_REFRESH_SECONDS = 1
 MAX_TRANSCRIPT_LINES = 300
 AUDIO_LEVEL_WINDOW_SIZE = 120
-MODEL_MIN_PEAK_FOR_ASR = 2500.0
+MODEL_MIN_PEAK_FOR_ASR = 3500.0
+MODEL_MIN_DBFS_FOR_ASR = -50.0
+MODEL_ACTIVITY_ABS_AMPLITUDE = 700.0
+MODEL_MIN_ACTIVITY_RATIO_FOR_ASR = 0.01
+MODEL_MAX_WORDS_PER_SECOND = 7.0
+MODEL_WORD_BURST_ALLOWANCE = 8
+MODEL_MAX_CONSECUTIVE_SAME_WORD = 4
+MODEL_MIN_WORDS_FOR_DIVERSITY_CHECK = 18
+MODEL_MIN_UNIQUE_WORD_RATIO = 0.35
 
 
 @dataclass
@@ -67,7 +75,12 @@ current_audio_stats = {
     "rms": 0.0,
     "peak": 0.0,
 }
-last_asr_action = f"waiting (peak threshold: {MODEL_MIN_PEAK_FOR_ASR:.0f})"
+last_asr_action = (
+    "waiting "
+    f"(peak>={MODEL_MIN_PEAK_FOR_ASR:.0f}, "
+    f"dbfs>={MODEL_MIN_DBFS_FOR_ASR:.1f}, "
+    f"activity>={MODEL_MIN_ACTIVITY_RATIO_FOR_ASR:.3f})"
+)
 
 
 def handle_shutdown_signal(signum, _frame):
@@ -161,15 +174,36 @@ def cleanup_transcribed_chunks_locked():
 
 def get_newest_untranscribed_chunk():
     """
-    Return newest chunk (most recent arrival) that is not transcribed yet.
-    Mark it in-progress to avoid duplicate processing.
+    Return newest untranscribed chunk and drop older pending chunks to keep
+    end-to-end latency low for realtime display.
     """
     with buffer_lock:
-        for record in reversed(file_buffer):
-            if not record.transcribed and not record.in_progress:
-                record.in_progress = True
-                return record
-    return None
+        pending = [r for r in file_buffer if not r.transcribed and not r.in_progress]
+        if not pending:
+            return None, 0
+
+        newest = pending[-1]
+        stale_pending = pending[:-1]
+        dropped = 0
+
+        if stale_pending:
+            stale_ids = {id(r) for r in stale_pending}
+            kept_records: deque[ChunkRecord] = deque()
+            for record in file_buffer:
+                if id(record) in stale_ids:
+                    dropped += 1
+                    try:
+                        if os.path.exists(record.file_path):
+                            os.remove(record.file_path)
+                    except Exception as e:
+                        print(f"[-] Drop stale chunk cleanup error for {record.file_path}: {e}")
+                    continue
+                kept_records.append(record)
+            file_buffer.clear()
+            file_buffer.extend(kept_records)
+
+        newest.in_progress = True
+        return newest, dropped
 
 
 def load_wav_for_asr(file_path: str):
@@ -212,8 +246,83 @@ def append_transcript_line(transcript: str):
     text = (transcript or "").strip()
     if not text or text == ".":
         return
+
+    normalized = " ".join(text.lower().split())
     with transcript_lock:
+        if transcript_log:
+            previous_normalized = " ".join(transcript_log[-1].lower().split())
+            if normalized == previous_normalized:
+                return
         transcript_log.append(text)
+
+
+def sanitize_transcript_text(transcript: str, chunk_seconds: float) -> str:
+    text = " ".join((transcript or "").split()).strip()
+    if not text:
+        return ""
+
+    words = text.split(" ")
+    max_allowed_words = int(chunk_seconds * MODEL_MAX_WORDS_PER_SECOND) + MODEL_WORD_BURST_ALLOWANCE
+    if len(words) > max_allowed_words:
+        return ""
+
+    collapsed_words: list[str] = []
+    previous_norm = ""
+    run_length = 0
+    for word in words:
+        normalized = "".join(ch for ch in word.lower() if ch.isalnum())
+        if normalized and normalized == previous_norm:
+            run_length += 1
+        else:
+            previous_norm = normalized
+            run_length = 1
+
+        if run_length <= MODEL_MAX_CONSECUTIVE_SAME_WORD:
+            collapsed_words.append(word)
+
+    cleaned_text = " ".join(collapsed_words).strip()
+    tokenized = ["".join(ch for ch in w.lower() if ch.isalnum()) for w in collapsed_words]
+    tokenized = [w for w in tokenized if w]
+    if len(tokenized) >= MODEL_MIN_WORDS_FOR_DIVERSITY_CHECK:
+        unique_ratio = len(set(tokenized)) / len(tokenized)
+        if unique_ratio < MODEL_MIN_UNIQUE_WORD_RATIO:
+            return ""
+
+    return cleaned_text
+
+
+def compute_chunk_gate_stats(asr_input: dict[str, np.ndarray | int]) -> dict[str, float]:
+    audio = np.asarray(asr_input["array"], dtype=np.float32)
+    if audio.size == 0:
+        return {
+            "peak": 0.0,
+            "rms": 0.0,
+            "dbfs": -120.0,
+            "activity_ratio": 0.0,
+        }
+
+    amplitude = np.abs(audio) * 32768.0
+    peak = float(np.max(amplitude))
+    rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))) * 32768.0)
+    dbfs = float(20.0 * np.log10(max(rms / 32768.0, 1e-12)))
+    activity_ratio = float(np.mean(amplitude >= MODEL_ACTIVITY_ABS_AMPLITUDE))
+
+    return {
+        "peak": peak,
+        "rms": rms,
+        "dbfs": dbfs,
+        "activity_ratio": activity_ratio,
+    }
+
+
+def get_asr_skip_reason(gate_stats: dict[str, float]) -> str | None:
+    if gate_stats["peak"] < MODEL_MIN_PEAK_FOR_ASR:
+        return f"peak<{MODEL_MIN_PEAK_FOR_ASR:.0f}"
+    if gate_stats["dbfs"] < MODEL_MIN_DBFS_FOR_ASR:
+        return f"dbfs<{MODEL_MIN_DBFS_FOR_ASR:.1f}"
+    if gate_stats["activity_ratio"] < MODEL_MIN_ACTIVITY_RATIO_FOR_ASR:
+        return f"activity<{MODEL_MIN_ACTIVITY_RATIO_FOR_ASR:.3f}"
+    return None
 
 
 def parse_float_or_default(value, default: float) -> float:
@@ -246,7 +355,8 @@ def get_audio_level_view() -> str:
         peak = current_audio_stats["peak"]
     return (
         f"Current chunk level: {dbfs:.1f} dBFS | RMS: {rms:.0f} | Peak: {peak:.0f} "
-        f"| ASR peak threshold: {MODEL_MIN_PEAK_FOR_ASR:.0f} | Last ASR action: {last_asr_action}"
+        f"| ASR thresholds: peak>={MODEL_MIN_PEAK_FOR_ASR:.0f}, dbfs>={MODEL_MIN_DBFS_FOR_ASR:.1f}, "
+        f"activity>={MODEL_MIN_ACTIVITY_RATIO_FOR_ASR:.3f} | Last ASR action: {last_asr_action}"
     )
 
 
@@ -346,26 +456,39 @@ def transcribe_worker():
     global last_asr_action
     print("[*] Transcription worker started.")
     while not shutdown_event.is_set():
-        record = get_newest_untranscribed_chunk()
+        record, dropped_count = get_newest_untranscribed_chunk()
         if record is None:
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
 
+        if dropped_count > 0:
+            print(f"[*] Dropped {dropped_count} stale pending chunk(s) to stay realtime.")
+
         transcript = ""
         try:
-            if record.peak < MODEL_MIN_PEAK_FOR_ASR:
+            asr_input = load_wav_for_asr(record.file_path)
+            gate_stats = compute_chunk_gate_stats(asr_input)
+            skip_reason = get_asr_skip_reason(gate_stats)
+            if skip_reason is not None:
                 transcript = ""
-                last_asr_action = "skipped low-level chunk"
+                last_asr_action = f"skipped ({skip_reason})"
                 continue
 
-            asr_input = load_wav_for_asr(record.file_path)
+            # Some Transformers versions may mutate/pop keys from the input dict.
+            # Compute duration before calling the pipeline.
+            chunk_seconds = len(asr_input["array"]) / float(asr_input["sampling_rate"])
+
             result = asr_pipeline(
                 asr_input,
                 generate_kwargs={"task": "transcribe"},
             )
-            transcript = result.get("text", "").strip()
-            last_asr_action = "transcribed chunk"
-            append_transcript_line(transcript)
+            raw_transcript = result.get("text", "").strip()
+            transcript = sanitize_transcript_text(raw_transcript, chunk_seconds)
+            if transcript:
+                last_asr_action = "transcribed chunk"
+                append_transcript_line(transcript)
+            else:
+                last_asr_action = "discarded likely hallucination"
         except Exception as e:
             transcript = f"[transcription_error] {e}"
             last_asr_action = "error"
